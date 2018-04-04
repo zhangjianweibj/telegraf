@@ -81,6 +81,9 @@ test-all: fmtcheck vet
 package:
 	./scripts/build.py --package --platform=all --arch=all
 
+package-windows:
+	./scripts/build.py --package --platform=windows --arch=all
+
 clean:
 	rm -f telegraf
 	rm -f telegraf.exe
