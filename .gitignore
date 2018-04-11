@@ -2,6 +2,3 @@
 /telegraf
 /telegraf.exe
 /telegraf.gz
-*~
-*#
-*.tar.gz
