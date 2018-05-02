@@ -20,15 +20,16 @@ import (
 
 // AzureMonitor allows publishing of metrics to the Azure Monitor custom metrics service
 type AzureMonitor struct {
-	ResourceID          string            `toml:"resourceId"`
+	ResourceID          string            `toml:"resource_id"`
 	Region              string            `toml:"region"`
 	Timeout             internal.Duration `toml:"Timeout"`
-	AzureSubscriptionID string            `toml:"azureSubscription"`
-	AzureTenantID       string            `toml:"azureTenant"`
-	AzureClientID       string            `toml:"azureClientId"`
-	AzureClientSecret   string            `toml:"azureClientSecret"`
+	AzureSubscriptionID string            `toml:"azure_subscription"`
+	AzureTenantID       string            `toml:"azure_tenant"`
+	AzureClientID       string            `toml:"azure_client_id"`
+	AzureClientSecret   string            `toml:"azure_client_secret"`
+	StringAsDimension   bool              `toml:"string_as_dimension"`
 
-	useMsi           bool
+	useMsi           bool `toml:"use_managed_service_identity"`
 	metadataService  *AzureInstanceMetadata
 	instanceMetadata *VirtualMachineMetadata
 	msiToken         *msiToken
@@ -76,36 +77,38 @@ type azureMonitorSeries struct {
 }
 
 var sampleConfig = `
-## The resource ID against which metric will be logged.  If not
-## specified, the plugin will attempt to retrieve the resource ID
-## of the VM via the instance metadata service (optional if running 
-## on an Azure VM with MSI)
-#resourceId = "/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Compute/virtualMachines/<vm-name>"
-## Azure region to publish metrics against.  Defaults to eastus.
-## Leave blank to automatically query the region via MSI.
-#region = "useast"
+  ## The resource ID against which metric will be logged.  If not
+  ## specified, the plugin will attempt to retrieve the resource ID
+  ## of the VM via the instance metadata service (optional if running 
+  ## on an Azure VM with MSI)
+  #resource_id = "/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Compute/virtualMachines/<vm-name>"
+  ## Azure region to publish metrics against.  Defaults to eastus.
+  ## Leave blank to automatically query the region via MSI.
+  #region = "useast"
 
-## Write HTTP timeout, formatted as a string.  If not provided, will default
-## to 5s. 0s means no timeout (not recommended).
-# timeout = "5s"
+  ## Write HTTP timeout, formatted as a string.  If not provided, will default
+  ## to 5s. 0s means no timeout (not recommended).
+  # timeout = "5s"
 
-## Whether or not to use managed service identity.
-#useManagedServiceIdentity = true
+  ## Whether or not to use managed service identity.
+  #use_managed_service_identity = true
 
-## Fill in the following values if using Active Directory Service
-## Principal or User Principal for authentication.
-## Subscription ID
-#azureSubscription = ""
-## Tenant ID
-#azureTenant = ""
-## Client ID
-#azureClientId = ""
-## Client secrete
-#azureClientSecret = ""
+  ## Fill in the following values if using Active Directory Service
+  ## Principal or User Principal for authentication.
+  ## Subscription ID
+  #azure_subscription = ""
+  ## Tenant ID
+  #azure_tenant = ""
+  ## Client ID
+  #azure_client_id = ""
+  ## Client secrete
+  #azure_client_secret = ""
 `
 
 const (
 	defaultRegion = "eastus"
+
+	defaultMSIResource = "https://monitoring.azure.com/"
 )
 
 // Connect initializes the plugin and validates connectivity
@@ -119,7 +122,7 @@ func (a *AzureMonitor) Connect() error {
 		return fmt.Errorf("Must provide values for azureSubscription, azureTenant, azureClient and azureClientSecret, or leave all blank to default to MSI")
 	}
 
-	if a.useMsi == false {
+	if !a.useMsi {
 		// If using direct AD authentication create the AD access client
 		oauthConfig, err := adal.NewOAuthConfig(azure.PublicCloud.ActiveDirectoryEndpoint, a.AzureTenantID)
 		if err != nil {
@@ -292,6 +295,19 @@ func (a *AzureMonitor) add(metric telegraf.Metric) {
 		dimensionValues = append(dimensionValues, tag.Value)
 	}
 
+	// Azure Monitoe does not support string value types, so convert string
+	// fields to dimensions if enabled.
+	if a.StringAsDimension {
+		for _, f := range metric.FieldList() {
+			switch fv := f.Value.(type) {
+			case string:
+				dimensionNames = append(dimensionNames, f.Key)
+				dimensionValues = append(dimensionValues, fv)
+				metric.RemoveField(f.Key)
+			}
+		}
+	}
+
 	for _, f := range metric.FieldList() {
 		name := metric.Name() + "_" + f.Key
 		fv, ok := convert(f.Value)
@@ -377,39 +393,24 @@ func (s *azureMonitorSeries) equal(dv []string) bool {
 
 func convert(in interface{}) (float64, bool) {
 	switch v := in.(type) {
-	case int:
-		return float64(v), true
-	case int8:
-		return float64(v), true
-	case int16:
-		return float64(v), true
-	case int32:
-		return float64(v), true
 	case int64:
-		return float64(v), true
-	case uint:
-		return float64(v), true
-	case uint8:
-		return float64(v), true
-	case uint16:
-		return float64(v), true
-	case uint32:
 		return float64(v), true
 	case uint64:
 		return float64(v), true
-	case float32:
-		return float64(v), true
 	case float64:
 		return v, true
+	case bool:
+		if v {
+			return 1, true
+		}
+		return 1, true
 	case string:
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			log.Printf("converted string: %s to %v", v, f)
 			return 0, false
 		}
 		return f, true
 	default:
-		log.Printf("did not convert %T: %s", v, v)
 		return 0, false
 	}
 }
@@ -479,12 +480,13 @@ func (a *AzureMonitor) postData(msg *[]byte) (*http.Request, error) {
 func init() {
 	outputs.Add("azuremonitor", func() telegraf.Output {
 		return &AzureMonitor{
-			Timeout:  internal.Duration{Duration: time.Second * 5},
-			Region:   defaultRegion,
-			period:   time.Minute,
-			delay:    time.Second * 5,
-			metrics:  make(chan telegraf.Metric, 100),
-			shutdown: make(chan struct{}),
+			StringAsDimension: true,
+			Timeout:           internal.Duration{Duration: time.Second * 5},
+			Region:            defaultRegion,
+			period:            time.Minute,
+			delay:             time.Second * 5,
+			metrics:           make(chan telegraf.Metric, 100),
+			shutdown:          make(chan struct{}),
 		}
 	})
 }
