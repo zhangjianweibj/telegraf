@@ -8,6 +8,7 @@ import (
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
 
+	netint "github.com/influxdata/telegraf/plugins/inputs/system/net"
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/disk"
 	"github.com/shirou/gopsutil/mem"
@@ -144,7 +145,7 @@ func (s *systemPS) NetProto() ([]net.ProtoCountersStat, error) {
 }
 
 func (s *systemPS) NetIO() ([]net.IOCountersStat, error) {
-	return net.IOCounters(true)
+	return netint.IOCounters(true)
 }
 
 func (s *systemPS) NetConnections() ([]net.ConnectionStat, error) {
