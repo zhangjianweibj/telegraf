@@ -20,6 +20,9 @@ import (
 	"github.com/influxdata/telegraf/plugins/outputs"
 )
 
+var _ telegraf.AggregatingOutput = (*AzureMonitor)(nil)
+var _ telegraf.Output = (*AzureMonitor)(nil)
+
 // AzureMonitor allows publishing of metrics to the Azure Monitor custom metrics service
 type AzureMonitor struct {
 	useMsi              bool              `toml:"use_managed_service_identity"`
@@ -32,6 +35,7 @@ type AzureMonitor struct {
 	AzureClientSecret   string            `toml:"azure_client_secret"`
 	StringAsDimension   bool              `toml:"string_as_dimension"`
 
+	url string
 	msiToken    *msiToken
 	oauthConfig *adal.OAuthConfig
 	adalToken   adal.OAuthTokenProvider
@@ -40,6 +44,19 @@ type AzureMonitor struct {
 
 	cache map[time.Time]map[uint64]*aggregate
 }
+
+type aggregate struct {
+	telegraf.Metric
+	updated bool
+}
+
+const (
+	defaultRegion string = "eastus"
+
+	defaultMSIResource string = "https://monitoring.azure.com/"
+
+	urlTemplate string = "https://%s.monitoring.azure.com%s/metrics"
+)
 
 var sampleConfig = `
   ## The resource ID against which metric will be logged.  If not
@@ -70,19 +87,24 @@ var sampleConfig = `
   #azure_client_secret = ""
 `
 
-const (
-	defaultRegion string = "eastus"
+// Description provides a description of the plugin
+func (a *AzureMonitor) Description() string {
+	return "Configuration for sending aggregate metrics to Azure Monitor"
+}
 
-	defaultMSIResource string = "https://monitoring.azure.com/"
-
-	metricsURLTemplate string = "https://%s.monitoring.azure.com%s/metrics"
-)
-
-var _ telegraf.AggregatingOutput = (*AzureMonitor)(nil)
+// SampleConfig provides a sample configuration for the plugin
+func (a *AzureMonitor) SampleConfig() string {
+	return sampleConfig
+}
 
 // Connect initializes the plugin and validates connectivity
 func (a *AzureMonitor) Connect() error {
-	// Set defaults
+	a.client = &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		},
+		Timeout: a.Timeout.Duration,
+	}
 
 	// If no direct AD values provided, fall back to MSI
 	if a.AzureSubscriptionID == "" && a.AzureTenantID == "" && a.AzureClientID == "" && a.AzureClientSecret == "" {
@@ -111,12 +133,7 @@ func (a *AzureMonitor) Connect() error {
 		a.Region = metadata.Compute.Location
 	}
 
-	a.client = &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-		},
-		Timeout: a.Timeout.Duration,
-	}
+	a.url := fmt.Sprintf(urlTemplate, a.Region, a.ResourceID)
 
 	// Validate credentials
 	err = a.validateCredentials()
@@ -137,7 +154,6 @@ func (a *AzureMonitor) validateCredentials() error {
 			if err != nil {
 				return err
 			}
-			log.Printf("Bearer token acquired; expiring in %s\n", msiToken.ExpiresInDuration().String())
 			a.msiToken = msiToken
 		}
 		return nil
@@ -153,18 +169,9 @@ func (a *AzureMonitor) validateCredentials() error {
 	return nil
 }
 
-// Description provides a description of the plugin
-func (a *AzureMonitor) Description() string {
-	return "Configuration for sending aggregate metrics to Azure Monitor"
-}
-
-// SampleConfig provides a sample configuration for the plugin
-func (a *AzureMonitor) SampleConfig() string {
-	return sampleConfig
-}
-
 // Close shuts down an any active connections
 func (a *AzureMonitor) Close() error {
+	a.client = nil
 	return nil
 }
 
@@ -189,12 +196,12 @@ type azureMonitorSeries struct {
 	Min             float64  `json:"min"`
 	Max             float64  `json:"max"`
 	Sum             float64  `json:"sum"`
-	Count           float64  `json:"count"`
+	Count           int64    `json:"count"`
 }
 
 // Write writes metrics to the remote endpoint
 func (a *AzureMonitor) Write(metrics []telegraf.Metric) error {
-	var azmetrics map[uint64]*azureMonitorMetric
+	azmetrics := make(map[uint64]*azureMonitorMetric, len(metrics))
 	for _, m := range metrics {
 		id := hashIDWithTagKeysOnly(m)
 		if azm, ok := azmetrics[id]; !ok {
@@ -208,13 +215,12 @@ func (a *AzureMonitor) Write(metrics []telegraf.Metric) error {
 	}
 
 	var body []byte
-	for _, m := range metrics {
+	for _, m := range azmetrics {
 		// Azure Monitor accepts new batches of points in new-line delimited
-		// JSON, following RFC 4288.
+		// JSON, following RFC 4288 (see https://github.com/ndjson/ndjson-spec).
 		jsonBytes, err := json.Marshal(&m)
 		if err != nil {
-			log.Printf("Error marshalling metrics %s", err)
-			return nil
+			return err
 		}
 		body = append(body, jsonBytes...)
 		body = append(body, '\n')
@@ -224,10 +230,7 @@ func (a *AzureMonitor) Write(metrics []telegraf.Metric) error {
 		return fmt.Errorf("Error authenticating: %v", err)
 	}
 
-	metricsEndpoint := fmt.Sprintf(metricsURLTemplate,
-		a.Region, a.ResourceID)
-
-	req, err := http.NewRequest("POST", metricsEndpoint, bytes.NewBuffer(body))
+	req, err := http.NewRequest("POST", a.url, bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
@@ -239,12 +242,10 @@ func (a *AzureMonitor) Write(metrics []telegraf.Metric) error {
 	if err != nil {
 		return err
 	}
-
 	defer resp.Body.Close()
-	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
-		var reply []byte
-		reply, err = ioutil.ReadAll(resp.Body)
 
+	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
+		reply, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			reply = nil
 		}
@@ -270,28 +271,28 @@ func hashIDWithTagKeysOnly(m telegraf.Metric) uint64 {
 	return h.Sum64()
 }
 
-func translate(metric telegraf.Metric) *azureMonitorMetric {
+func translate(m telegraf.Metric) *azureMonitorMetric {
 	var dimensionNames []string
 	var dimensionValues []string
-	for i, tag := range metric.TagList() {
+	for i, tag := range m.TagList() {
 		// Azure custom metrics service supports up to 10 dimensions
 		if i > 10 {
-			log.Printf("W! [outputs.azuremonitor] metric [%s] exceeds 10 dimensions", metric.Name())
+			log.Printf("W! [outputs.azuremonitor] metric [%s] exceeds 10 dimensions", m.Name())
 			continue
 		}
 		dimensionNames = append(dimensionNames, tag.Key)
 		dimensionValues = append(dimensionValues, tag.Value)
 	}
 
-	min, _ := metric.GetField("min")
-	max, _ := metric.GetField("max")
-	sum, _ := metric.GetField("sum")
-	count, _ := metric.GetField("count")
+	min, _ := m.GetField("min")
+	max, _ := m.GetField("max")
+	sum, _ := m.GetField("sum")
+	count, _ := m.GetField("count")
 	return &azureMonitorMetric{
-		Time: metric.Time(),
+		Time: m.Time(),
 		Data: &azureMonitorData{
 			BaseData: &azureMonitorBaseData{
-				Metric:         metric.Name(),
+				Metric:         m.Name(),
 				Namespace:      "default",
 				DimensionNames: dimensionNames,
 				Series: []*azureMonitorSeries{
@@ -300,7 +301,7 @@ func translate(metric telegraf.Metric) *azureMonitorMetric {
 						Min:             min.(float64),
 						Max:             max.(float64),
 						Sum:             sum.(float64),
-						Count:           count.(float64),
+						Count:           count.(int64),
 					},
 				},
 			},
@@ -308,19 +309,14 @@ func translate(metric telegraf.Metric) *azureMonitorMetric {
 	}
 }
 
-type aggregate struct {
-	m       telegraf.Metric
-	updated bool
-}
-
 // Add will append a metric to the output aggregate
 func (a *AzureMonitor) Add(m telegraf.Metric) {
 	// Azure Monitor only supports aggregates 30 minutes into the past
-	// and 4 minutes into the future. Future metrics are dropped when written.
+	// and 4 minutes into the future. Future metrics are dropped when pushed.
 	t := m.Time()
 	tbucket := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, t.Location())
-	if tbucket.After(time.Now().Truncate(time.Minute * 30)) {
-		// TODO(gunnar): log metric is too late to fit within the aggregation window
+	if tbucket.Before(time.Now().Add(-time.Minute * 30)) {
+		log.Printf("W! attempted to aggregate metric over 30 minutes old: %v, %v", t, tbucket)
 		return
 	}
 
@@ -349,43 +345,29 @@ func (a *AzureMonitor) Add(m telegraf.Metric) {
 		if !ok {
 			// Time bucket does not exist and needs to be created.
 			a.cache[tbucket] = make(map[uint64]*aggregate)
-			a.cache[tbucket][id] = &aggregate{
-				m:       newAggMetric(name, m.Tags(), fv, tbucket),
-				updated: true,
-			}
-			continue
 		}
 
+		nf := make(map[string]interface{}, 4)
+		nf["min"] = fv
+		nf["max"] = fv
+		nf["sum"] = fv
+		nf["count"] = 1
+		// Fetch existing aggregate
 		agg, ok := a.cache[tbucket][id]
-		if !ok {
-			// Aggregate metric does not exist and needs to be created.
-			a.cache[tbucket][id] = &aggregate{
-				m:       newAggMetric(name, m.Tags(), fv, tbucket),
-				updated: true,
+		if ok {
+			aggfields := agg.Fields()
+			if fv > aggfields["min"].(float64) {
+				nf["min"] = aggfields["min"]
 			}
-			continue
+			if fv < aggfields["max"].(float64) {
+				nf["max"] = aggfields["max"]
+			}
+			nf["sum"] = fv + aggfields["sum"].(float64)
+			nf["count"] = aggfields["count"].(int64) + 1
 		}
 
-		// Add new value to existing aggregate metric
-		for _, tf := range agg.m.FieldList() {
-			tfv := tf.Value.(float64)
-			switch tf.Key {
-			case "min":
-				if fv < tfv {
-					agg.m.AddField("min", fv)
-				}
-			case "max":
-				if fv > tfv {
-					agg.m.AddField("max", fv)
-				}
-			case "sum":
-				agg.m.AddField("sum", tfv+fv)
-			case "count":
-				agg.m.AddField("count", tfv+1)
-			}
-		}
-		agg.updated = true
-		a.cache[tbucket][id] = agg
+		na, _ := metric.New(name, m.Tags(), nf, tbucket)
+		a.cache[tbucket][id] = &aggregate{na, true}
 	}
 }
 
@@ -413,21 +395,6 @@ func sanitize(value string) string {
 	return invalidNameCharRE.ReplaceAllString(value, "_")
 }
 
-func newAggMetric(name string, tags map[string]string, fv float64, t time.Time) telegraf.Metric {
-	nm, _ := metric.New(
-		name,
-		tags,
-		map[string]interface{}{
-			"min":   fv,
-			"max":   fv,
-			"sum":   fv,
-			"count": 1,
-		},
-		t,
-	)
-	return nm
-}
-
 func hashIDWithField(id uint64, fk string) uint64 {
 	h := fnv.New64a()
 	b := make([]byte, binary.MaxVarintLen64)
@@ -442,14 +409,18 @@ func hashIDWithField(id uint64, fk string) uint64 {
 // Push sends metrics to the output metric buffer
 func (a *AzureMonitor) Push() []telegraf.Metric {
 	var metrics []telegraf.Metric
-	for _, aggs := range a.cache {
+	for tbucket, aggs := range a.cache {
+		// Do not send metrics early
+		if tbucket.After(time.Now().Add(-time.Minute)) {
+			continue
+		}
 		for _, agg := range aggs {
 			// Only send aggregates that have had an update since
 			// the last push.
 			if !agg.updated {
 				continue
 			}
-			metrics = append(metrics, agg.m)
+			metrics = append(metrics, agg.Metric)
 		}
 	}
 	return metrics
@@ -459,7 +430,7 @@ func (a *AzureMonitor) Push() []telegraf.Metric {
 func (a *AzureMonitor) Reset() {
 	for tbucket := range a.cache {
 		// Remove aggregates older than 30 minutes
-		if tbucket.After(time.Now().Truncate(time.Minute * 30)) {
+		if tbucket.Before(time.Now().Add(-time.Minute * 30)) {
 			delete(a.cache, tbucket)
 			continue
 		}
@@ -472,9 +443,10 @@ func (a *AzureMonitor) Reset() {
 func init() {
 	outputs.Add("azuremonitor", func() telegraf.Output {
 		return &AzureMonitor{
-			StringAsDimension: true,
+			StringAsDimension: false,
 			Timeout:           internal.Duration{Duration: time.Second * 5},
 			Region:            defaultRegion,
+			cache:             make(map[time.Time]map[uint64]*aggregate, 36),
 		}
 	})
 }
