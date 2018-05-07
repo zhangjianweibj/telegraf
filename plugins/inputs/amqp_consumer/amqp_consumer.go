@@ -22,9 +22,14 @@ type AMQPConsumer struct {
 	Exchange string
 	// Queue Name
 	Queue string
+	//Exchange Durable
+	ExchangeDurable bool `toml:"exchange_durable"`
 	// Binding Key
 	BindingKey string `toml:"binding_key"`
-
+	//Queue Durable
+	QueueDurable bool `toml:"queue_durable"`
+	//Queue Exclusive
+	QueueExclusive bool `toml:"queue_exclusive"`
 	// Controls how many messages the server will try to keep on the network
 	// for consumers before receiving delivery acks.
 	PrefetchCount int
@@ -177,7 +182,7 @@ func (a *AMQPConsumer) connect(amqpConf *amqp.Config) (<-chan amqp.Delivery, err
 	err = ch.ExchangeDeclare(
 		a.Exchange, // name
 		"topic",    // type
-		true,       // durable
+		a.ExchangeDurable,       // durable
 		false,      // auto-deleted
 		false,      // internal
 		false,      // no-wait
@@ -189,9 +194,9 @@ func (a *AMQPConsumer) connect(amqpConf *amqp.Config) (<-chan amqp.Delivery, err
 
 	q, err := ch.QueueDeclare(
 		a.Queue, // queue
-		true,    // durable
+		a.QueueDurable,    // durable
 		false,   // delete when unused
-		false,   // exclusive
+		a.QueueExclusive,   // exclusive
 		false,   // no-wait
 		nil,     // arguments
 	)
